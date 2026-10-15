@@ -59,6 +59,9 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_WORKSHEET = os.getenv("GOOGLE_WORKSHEET", "")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")  # raw JSON or base64
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")  # local fallback
+BLOCK_LIMIT = _env_int("BLOCK_LIMIT", 8)  # consecutive blocked profiles before the run aborts
+DEBUG_DIR = os.getenv("DEBUG_DIR", "debug")
+DEBUG_DUMPS_MAX = _env_int("DEBUG_DUMPS_MAX", 3)  # screenshots/log dumps of blocked pages
 RUN_ONCE = os.getenv("RUN_ONCE", "false").lower() == "true"  # GitHub Actions: one pass then exit
 MAX_RUNTIME_MINUTES = _env_int("MAX_RUNTIME_MINUTES", 0)  # 0 = unlimited (Render worker)
 
@@ -103,7 +106,9 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("tiktok-worker")
+logging.getLogger("fake_useragent").setLevel(logging.ERROR)  # silence harmless fallback warnings
 STOP = asyncio.Event()
+BLOCK_STATE = {"streak": 0, "tripped": False, "dumps": 0}
 
 
 class BlockedError(Exception):
@@ -289,17 +294,23 @@ class Sheet:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def random_user_agent() -> str:
-    fallback = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+def random_user_agent(real_version: str = "") -> str:
+    """fake-useragent pick, but only if its Chrome version is close to the real browser (consistency)."""
+    consistent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{real_version or '129.0.0.0'} Safari/537.36"
     )
     if UserAgent is None:
-        return fallback
+        return consistent
     try:
-        return UserAgent(browsers=["Chrome", "Edge"], os=["Windows", "Mac OS X"], platforms=["desktop"]).random
+        ua = UserAgent(browsers=["Chrome"], os=["Windows", "Mac OS X"], platforms=["desktop"]).random
+        m = re.search(r"Chrome/(\d+)", ua)
+        real_major = int(real_version.split(".")[0]) if real_version else 0
+        if m and "Edg" not in ua and (not real_major or abs(int(m.group(1)) - real_major) <= 6):
+            return ua
     except Exception:
-        return fallback
+        pass
+    return consistent
 
 
 def clean_video_url(href: str) -> Optional[str]:
@@ -413,7 +424,7 @@ async def launch_browser(pw) -> Browser:
 
 async def new_context(browser: Browser) -> BrowserContext:
     ctx = await browser.new_context(
-        user_agent=random_user_agent(),
+        user_agent=random_user_agent(browser.version),
         viewport={"width": random.choice([1280, 1366, 1440, 1536]), "height": random.choice([720, 800, 900])},
         locale="en-US",
         timezone_id="UTC",
@@ -462,6 +473,24 @@ async def looks_blocked(page: Page) -> bool:
         pass
     text = await page_text(page)
     return "verify to continue" in text or ("something went wrong" in text and "refresh" in text)
+
+
+async def dump_debug(page: Page, tag: str, extra: str = "") -> None:
+    """Log what TikTok really returned (captcha? login wall? empty?) + screenshot, a few times per run."""
+    if BLOCK_STATE["dumps"] >= DEBUG_DUMPS_MAX:
+        return
+    BLOCK_STATE["dumps"] += 1
+    try:
+        title = await page.title()
+    except Exception:
+        title = "?"
+    body = " ".join((await page_text(page))[:400].split())
+    log.warning("DEBUG %s | url=%s | title=%r | body=%r | api_calls=%s", tag, page.url, title, body, extra)
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        await page.screenshot(path=f"{DEBUG_DIR}/{tag}.png")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -603,9 +632,12 @@ async def scan_profile_videos(ctx: BrowserContext, username: str, expected: int)
     items: Dict[str, dict] = {}
     state = {"responses": 0, "has_more": True}
     pending: List[asyncio.Task] = []
+    seen_api: List[str] = []
 
     async def on_response(resp):
         try:
+            if "/api/" in resp.url and len(seen_api) < 8:
+                seen_api.append(f"{resp.status}:{resp.url.split('?')[0][-40:]}")
             if "/api/post/item_list" not in resp.url or resp.status != 200:
                 return
             data = await resp.json()
@@ -660,6 +692,7 @@ async def scan_profile_videos(ctx: BrowserContext, username: str, expected: int)
 
         if not videos:
             if await looks_blocked(page) or expected > 0:
+                await dump_debug(page, f"profile_{username}", ",".join(seen_api) or "none")
                 raise BlockedError(f"no videos returned for @{username} (expected {expected})")
             return [], "empty"
         return videos[:PROFILE_MAX_VIDEOS], "ok"
@@ -698,11 +731,19 @@ async def followers_worker(wid: int, queue: asyncio.Queue, browser: Browser, his
             try:
                 await process_profile(ctx, username, expected, history, sheet, sheet_lock, stats)
                 fails = 0
+                BLOCK_STATE["streak"] = 0
                 stats["profiles"] += 1
                 log.info("[w%d] @%s done | profiles %d/%d | videos %d | matches %d",
                          wid, username, stats["profiles"], stats["total"], stats["videos"], stats["matches"])
-            except (BlockedError, Exception) as e:
+            except Exception as e:
                 fails += 1
+                if isinstance(e, BlockedError):
+                    BLOCK_STATE["streak"] += 1
+                    if BLOCK_STATE["streak"] >= BLOCK_LIMIT and not BLOCK_STATE["tripped"]:
+                        BLOCK_STATE["tripped"] = True
+                        log.error("TikTok is blocking this IP (%d blocked profiles in a row). Stopping the run. "
+                                  "Use a residential proxy (PROXY_SERVER) and see the DEBUG lines above.", BLOCK_STATE["streak"])
+                        STOP.set()
                 if attempt + 1 < MAX_ATTEMPTS:
                     await queue.put((username, expected, attempt + 1))
                 else:
@@ -815,7 +856,7 @@ async def run_discover_cycle(browser: Browser, history: History, sheet: Sheet) -
 # --------------------------------------------------------------------------- #
 # Main loop
 # --------------------------------------------------------------------------- #
-async def main() -> None:
+async def main() -> int:
     log.info("Starting worker | mode=%s | target=@%s | concurrency=%d", MODE, TARGET_USERNAME, CONCURRENCY)
     history = History(DB_PATH)
     sheet = Sheet()
@@ -873,10 +914,11 @@ async def main() -> None:
             except Exception:
                 pass
     log.info("Worker stopped cleanly")
+    return 2 if BLOCK_STATE["tripped"] else 0
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        sys.exit(asyncio.run(main()) or 0)
     except KeyboardInterrupt:
         pass
