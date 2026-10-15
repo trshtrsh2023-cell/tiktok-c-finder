@@ -1,0 +1,73 @@
+name: TikTok Comment Tracker
+
+on:
+  schedule:
+    - cron: '0 3 * * *'        # once a day (change as you like)
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Max runtime in minutes (1-330)'
+        required: false
+        default: '60'
+
+# never run two copies at the same time (they would share the same cache/history)
+concurrency:
+  group: tiktok-tracker
+  cancel-in-progress: false
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      # history.db remembers scanned profiles/videos between runs (resume support)
+      - name: Restore history
+        uses: actions/cache/restore@v4
+        with:
+          path: history.db*
+          key: history-${{ github.run_id }}
+          restore-keys: |
+            history-
+
+      - name: Check secrets
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
+        run: |
+          if [ -z "$GOOGLE_CREDENTIALS_JSON" ]; then echo "Error: secret GOOGLE_CREDENTIALS_JSON is missing"; exit 1; fi
+          if [ -z "$GOOGLE_SHEET_NAME" ]; then echo "Error: secret GOOGLE_SHEET_NAME is missing"; exit 1; fi
+
+      - name: Run tracker
+        env:
+          TARGET_USERNAME: ${{ secrets.TARGET_USERNAME }}
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          RUN_ONCE: 'true'
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.minutes || vars.RUN_MINUTES || '60' }}
+          CONCURRENCY: ${{ vars.CONCURRENCY || '2' }}
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+        run: python main.py
+
+      - name: Save history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: history.db*
+          key: history-${{ github.run_id }}
