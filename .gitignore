@@ -1,6 +1,8 @@
-   google_credentials.json
-   *credentials*.json
-   *service*account*.json
-   .env
-   history.db*
-   __pycache__/
+# NEVER commit secrets
+google_credentials.json
+*credentials*.json
+*service*account*.json
+.env
+
+history.db*
+__pycache__/
