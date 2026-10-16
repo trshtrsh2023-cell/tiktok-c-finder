@@ -58,12 +58,13 @@ jobs:
           GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           RUN_ONCE: 'true'
+          HEADLESS: ${{ vars.HEADLESS || 'false' }}   # 'false' runs a normal (headed) Chromium on a virtual screen
           MAX_RUNTIME_MINUTES: ${{ github.event.inputs.minutes || vars.RUN_MINUTES || '60' }}
           CONCURRENCY: ${{ vars.CONCURRENCY || '2' }}
           PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
-        run: python main.py
+        run: xvfb-run -a python main.py
 
       - name: Save history
         if: always()
