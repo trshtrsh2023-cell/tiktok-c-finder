@@ -59,6 +59,9 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_WORKSHEET = os.getenv("GOOGLE_WORKSHEET", "")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")  # raw JSON or base64
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")  # local fallback
+HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"  # "false" + xvfb-run = less detectable
+WARMUP = os.getenv("WARMUP", "true").lower() == "true"  # visit tiktok.com first to get normal cookies
+PROFILE_RELOADS = _env_int("PROFILE_RELOADS", 2)  # page reloads when TikTok says "Something went wrong"
 BLOCK_LIMIT = _env_int("BLOCK_LIMIT", 8)  # consecutive blocked profiles before the run aborts
 DEBUG_DIR = os.getenv("DEBUG_DIR", "debug")
 DEBUG_DUMPS_MAX = _env_int("DEBUG_DUMPS_MAX", 3)  # screenshots/log dumps of blocked pages
@@ -404,7 +407,7 @@ def load_followers(path: str) -> List[dict]:
 # --------------------------------------------------------------------------- #
 async def launch_browser(pw) -> Browser:
     kwargs = dict(
-        headless=True,
+        headless=HEADLESS,
         args=[
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -441,6 +444,23 @@ async def new_context(browser: Browser) -> BrowserContext:
     await ctx.route("**/*", _route)
     await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
     return ctx
+
+
+async def warm_up(ctx: BrowserContext) -> None:
+    """Open the home page once so the context gets the normal TikTok cookies/tokens before scraping."""
+    if not WARMUP:
+        return
+    page = await ctx.new_page()
+    try:
+        await page.goto("https://www.tiktok.com/", wait_until="domcontentloaded")
+        await human_pause(3, 5)
+        await dismiss_popups(page)
+        await page.mouse.wheel(0, random.randint(400, 900))
+        await human_pause(1.5, 3)
+    except Exception as e:
+        log.debug("warm-up failed: %s", e)
+    finally:
+        await page.close()
 
 
 async def dismiss_popups(page: Page) -> None:
@@ -632,38 +652,35 @@ async def scan_profile_videos(ctx: BrowserContext, username: str, expected: int)
     items: Dict[str, dict] = {}
     state = {"responses": 0, "has_more": True}
     pending: List[asyncio.Task] = []
-    seen_api: List[str] = []
+    diag: List[str] = []  # what the post-list API really answered (for DEBUG)
 
     async def on_response(resp):
         try:
-            if "/api/" in resp.url and len(seen_api) < 8:
-                seen_api.append(f"{resp.status}:{resp.url.split('?')[0][-40:]}")
-            if "/api/post/item_list" not in resp.url or resp.status != 200:
+            if "/api/post/item_list" not in resp.url:
                 return
-            data = await resp.json()
+            body = await resp.text()
+            if resp.status != 200 or not body.strip():
+                if len(diag) < 6:
+                    diag.append(f"http{resp.status}:len{len(body)}")
+                return
+            data = json.loads(body)
+            n = len(data.get("itemList") or [])
+            if len(diag) < 6:
+                diag.append(f"ok:code={data.get('statusCode')},msg={str(data.get('status_msg') or '')[:25]!r},items={n},more={data.get('hasMore')}")
             state["responses"] += 1
             state["has_more"] = bool(data.get("hasMore"))
             for it in data.get("itemList") or []:
                 vid = str(it.get("id"))
                 cnt = int((it.get("stats") or {}).get("commentCount") or 0)
                 items[vid] = {"url": f"https://www.tiktok.com/@{username}/video/{vid}", "comments": cnt}
-        except Exception:
-            pass
+        except Exception as e:
+            if len(diag) < 6:
+                diag.append(f"err:{type(e).__name__}")
 
     page.on("response", lambda r: pending.append(asyncio.create_task(on_response(r))))
+    dom_links: Dict[str, None] = {}
 
-    try:
-        await page.goto(f"https://www.tiktok.com/@{username}", wait_until="domcontentloaded")
-        await human_pause(2, 3.5)
-        await dismiss_popups(page)
-
-        text = await page_text(page)
-        if "this account is private" in text:
-            return [], "private"
-        if "couldn't find this account" in text:
-            return [], "empty"
-
-        dom_links: Dict[str, None] = {}
+    async def collect() -> None:
         stagnant, last_total = 0, -1
         for _ in range(PROFILE_SCROLLS):
             hrefs = await page.eval_on_selector_all(
@@ -683,6 +700,37 @@ async def scan_profile_videos(ctx: BrowserContext, username: str, expected: int)
             await page.mouse.wheel(0, random.randint(1800, 2800))
             await human_pause(1.0, 2.0)
 
+    try:
+        await page.goto(f"https://www.tiktok.com/@{username}", wait_until="domcontentloaded")
+        await human_pause(2, 3.5)
+        await dismiss_popups(page)
+
+        text = await page_text(page)
+        if "this account is private" in text:
+            return [], "private"
+        if "couldn't find this account" in text:
+            return [], "empty"
+
+        await collect()
+
+        # TikTok sometimes answers "Something went wrong ... refresh": try reloading like a human would
+        for attempt in range(PROFILE_RELOADS):
+            if items or dom_links:
+                break
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await human_pause(3, 6)
+            try:
+                btn = page.locator('button:has-text("Refresh")').first
+                if await btn.is_visible(timeout=1000):
+                    await btn.click(timeout=2000)
+                else:
+                    await page.reload(wait_until="domcontentloaded")
+            except Exception:
+                await page.reload(wait_until="domcontentloaded")
+            await human_pause(3, 5)
+            await collect()
+
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
@@ -692,7 +740,7 @@ async def scan_profile_videos(ctx: BrowserContext, username: str, expected: int)
 
         if not videos:
             if await looks_blocked(page) or expected > 0:
-                await dump_debug(page, f"profile_{username}", ",".join(seen_api) or "none")
+                await dump_debug(page, f"profile_{username}", "item_list=[" + "; ".join(diag) + "]" if diag else "item_list=none")
                 raise BlockedError(f"no videos returned for @{username} (expected {expected})")
             return [], "empty"
         return videos[:PROFILE_MAX_VIDEOS], "ok"
@@ -721,6 +769,7 @@ async def process_profile(ctx, username, expected, history, sheet, sheet_lock, s
 async def followers_worker(wid: int, queue: asyncio.Queue, browser: Browser, history: History,
                            sheet: Sheet, sheet_lock: asyncio.Lock, stats: dict) -> None:
     ctx = await new_context(browser)
+    await warm_up(ctx)
     processed, fails = 0, 0
     try:
         while not STOP.is_set():
@@ -757,10 +806,12 @@ async def followers_worker(wid: int, queue: asyncio.Queue, browser: Browser, his
                     pass
                 await interruptible_sleep(delay)
                 ctx = await new_context(browser)
+                await warm_up(ctx)
             processed += 1
             if processed % RECYCLE_CONTEXT_EVERY == 0:  # periodic cache clearing
                 await ctx.close()
                 ctx = await new_context(browser)
+                await warm_up(ctx)
     finally:
         try:
             await ctx.close()
